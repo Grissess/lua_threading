@@ -32,6 +32,10 @@ function libthread.thr_notify_on(thr, ev, ac, v)
 	return coroutine.yield("thr_notify_on", thr, ev, ac, v)
 end
 
+function libthread.thr_set_cancel(thr, ac, v)
+	return coroutine.yield("thr_set_cancel", thr, ac, v)
+end
+
 function libthread.thr_kill(thr)
 	return coroutine.yield("thr_kill", thr)
 end
@@ -52,6 +56,10 @@ function libthread.sc_read(sync)
 	return coroutine.yield("sc_read", sync)
 end
 
+function libthread.sc_badged(sync, ...)
+	return coroutine.yield("sc_badged", sync, ...)
+end
+
 function libthread.new_ac()
 	return coroutine.yield("new_ac")
 end
@@ -68,15 +76,35 @@ function libthread.ac_get(async)
 	return coroutine.yield("ac_get", async)
 end
 
+function libthread.ac_poll(async, msk)
+	return coroutine.yield("ac_poll", async, msk)
+end
+
 function libthread.ac_wait(async, msk)
 	return coroutine.yield("ac_wait", async, msk)
+end
+
+function libthread.convert_value(v)
+	local mt = getmetatable(v)
+	if mt ~= "nil" and type(mt) == "table" and mt.sys_convert ~= nil then
+		return mt.sys_convert(v)
+	end
+	return v
+end
+
+function libthread.convert_all_args(args)
+	for i, v in ipairs(args) do
+		args[i] = libthread.convert_value(v)
+	end
 end
 
 local Thread = {}
 libthread.Thread = Thread
 
 function Thread.new(f, ...)
-	return setmetatable({thr = libthread.new_thr(f, ...)}, Thread.mt)
+	local args = {...}
+	libthread.convert_all_args(args)
+	return setmetatable({thr = libthread.new_thr(f, table.unpack(args))}, Thread.mt)
 end
 
 function Thread.current()
@@ -96,7 +124,9 @@ function Thread:suspend()
 end
 
 function Thread:set_args(...)
-	return libthread.thr_set_args(self.thr, ...)
+	local args = {...}
+	libthread.convert_all_args(args)
+	return libthread.thr_set_args(self.thr, table.unpack(args))
 end
 
 function Thread:get_args()
@@ -108,7 +138,11 @@ function Thread:get_result()
 end
 
 function Thread:notify_on(ev, ac, v)
-	return libthread.thr_notify_on(self.thr, ev, ac, v)
+	return libthread.thr_notify_on(self.thr, ev, libthread.convert_value(ac), v)
+end
+
+function Thread:set_cancel(ac, v)
+	return libthread.thr_set_cancel(self.thr, libthread.convert_value(ac), v)
 end
 
 function Thread:kill()
@@ -117,6 +151,7 @@ end
 
 Thread.mt = {
 	__index = Thread,
+	sys_convert = function(self) return self.thr end,
 }
 
 local SyncChannel = {}
@@ -131,15 +166,31 @@ function SyncChannel.from(sc)
 end
 
 function SyncChannel:write(...)
-	return libthread.sc_write(self.sc, ...)
+	local args = {...}
+	libthread.convert_all_args(args)
+	return libthread.sc_write(self.sc, table.unpack(args))
 end
 
 function SyncChannel:read()
 	return libthread.sc_read(self.sc)
 end
 
+function SyncChannel:badged(...)
+	local args = {...}
+	libthread.convert_all_args(args)
+	return SyncChannel.from(libthread.sc_badged(self.sc, table.unpack(args)))
+end
+
+function SyncChannel:call(...)
+	local ret = SyncChannel.new()
+	self:write(ret, ...)
+	return ret:read()
+end
+
 SyncChannel.mt = {
 	__index = SyncChannel,
+	__call = SyncChannel.call,
+	sys_convert = function(self) return self.sc end,
 }
 
 local AsyncChannel = {}
@@ -165,12 +216,17 @@ function AsyncChannel:get()
 	return libthread.ac_get(self.ac)
 end
 
+function AsyncChannel:poll(msk)
+	return libthread.ac_poll(self.ac, msk)
+end
+
 function AsyncChannel:wait(msk)
 	return libthread.ac_wait(self.ac, msk)
 end
 
 AsyncChannel.mt = {
 	__index = AsyncChannel,
+	sys_convert = function(self) return self.ac end,
 }
 
 return libthread

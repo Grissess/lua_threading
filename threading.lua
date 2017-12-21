@@ -14,6 +14,8 @@ function threading.WAIT_INDEFINITELY() return false end
 local Thread = {}
 threading.Thread = Thread
 
+local _weak_mt = {__mode = "kv"}
+
 function Thread.new(obj, ...)
 	if type(obj) == "function" then
 		obj = coroutine.create(obj)
@@ -24,9 +26,10 @@ function Thread.new(obj, ...)
 	return setmetatable({
 		co = obj,
 		args = {...},
+		-- result = nil or {...}; return from the last coroutine.resume(), including success return if the coroutine died
 		state = "born",
-		caps = {},  -- singlet -> table (object)
-		rev_caps = {},
+		caps = setmetatable({}, _weak_mt),  -- singlet -> table (object)
+		rev_caps = setmetatable({}, _weak_mt),
 		notify = {
 			death = {},  -- When the thread is killed
 			run = {},  -- When the thread is scheduled
@@ -34,6 +37,8 @@ function Thread.new(obj, ...)
 			suspension = {},  -- When a thread is removed from schedulability
 			error = {},  -- When a thread encounters a kernel error (not an internal error--those cause death)
 		},
+		-- wchan = nil or a closure to be called during each scheduling attempt that returns false to block or true to continue
+		-- cancel = nil or {ac = AsyncChannel, msk = number} that, if ac:wait(msk) would not block, cancels the current wait channel
 	}, Thread.mt)
 end
 
@@ -107,12 +112,25 @@ function SyncChannel.new()
 	return setmetatable({writers = {}, readers = {}}, SyncChannel.mt)
 end
 
+function SyncChannel:badged(...)
+	local prefix = self.prefix or {}
+	local n = #prefix
+	for i, v in ipairs({...}) do
+		prefix[n+i] = v
+	end
+	return setmetatable({prefix = prefix}, {__index = self, __metatable = threading.SYNC_CHANNEL_OBJECT})
+end
+
 function SyncChannel:write(...)
 	local cur = threading.current
 	assert(not cur:is_waiting(), "call from sleeping thread")
 
 	self.writers[cur] = true
-	local data = {...}
+	local data = self.prefix or {}
+	local n = #data
+	for i, v in ipairs({...}) do
+		data[n+i] = v
+	end
 	cur.wchan = function()
 		local reader = next(self.readers)
 		if reader ~= nil then
@@ -159,6 +177,10 @@ end
 
 function AsyncChannel:get()
 	return self.value
+end
+
+function AsyncChannel:poll(msk)
+	return bit32.btest(self.value, msk)
 end
 
 function AsyncChannel:wait(msk)
@@ -237,13 +259,16 @@ threading.syscall_table = {
 		if getmetatable(thr) ~= THREAD_OBJECT then
 			return false, "not a thread"
 		end
-		return true, thr.args
+		return table.unpack(thr.args)
 	end,
 	thr_get_result = function(thr)
 		if getmetatable(thr) ~= THREAD_OBJECT then
 			return false, "not a thread"
 		end
-		return true, thr.result
+		if thr.result == nil then
+			return true
+		end
+		return true, table.unpack(thr.result)
 	end,
 	thr_notify_on = function(thr, ev, ac, v)
 		if getmetatable(thr) ~= THREAD_OBJECT then
@@ -253,6 +278,23 @@ threading.syscall_table = {
 			return false, "not an async channel"
 		end
 		return thr:notify_on(ev, ac, v)
+	end,
+	thr_set_cancel = function(thr, ac, v)
+		if getmetatable(thr) ~= THREAD_OBJECT then
+			return false, "not a thread"
+		end
+		if ac == nil then
+			thr.cancel = nil
+		else
+			if getmetatable(ac) ~= ASYNC_CHANNEL_OBJECT then
+				return false, "not an async channel or nil"
+			end
+			if type(v) ~= "number" then
+				return false, "expected a numeric value"
+			end
+			thr.cancel = {ac = ac, msk = v}
+		end
+		return true
 	end,
 	thr_kill = function(thr)
 		if getmetatable(thr) ~= THREAD_OBJECT then
@@ -278,10 +320,20 @@ threading.syscall_table = {
 		sync:read()
 		return  -- Return overridden by wchan on SyncChannel object
 	end,
+	sc_badged = function(sync, ...)
+		if getmetatable(sync) ~= SYNC_CHANNEL_OBJECT then
+			return false, "not a sync channel"
+		end
+		local ret = sync:badged(...)
+		return ret
+	end,
 	new_ac = function() return threading.AsyncChannel.new() end,
 	ac_set = function(async, v)
 		if getmetatable(async) ~= ASYNC_CHANNEL_OBJECT then
 			return false, "not an async channel"
+		end
+		if type(v) ~= "number" then
+			return false, "expected a numeric value"
 		end
 		async:set(v)
 		return true
@@ -289,6 +341,9 @@ threading.syscall_table = {
 	ac_unset = function(async, v)
 		if getmetatable(async) ~= ASYNC_CHANNEL_OBJECT then
 			return false, "not an async channel"
+		end
+		if type(v) ~= "number" then
+			return false, "expected a numeric value"
 		end
 		async:unset(v)
 		return true
@@ -299,9 +354,21 @@ threading.syscall_table = {
 		end
 		return async.value
 	end,
+	ac_poll = function(async, msk)
+		if getmetatable(async) ~= ASYNC_CHANNEL_OBJECT then
+			return false, "not an async channel"
+		end
+		if type(msk) ~= "number" then
+			return false, "expected a numeric mask"
+		end
+		return async:poll(msk)
+	end,
 	ac_wait = function(async, msk)
 		if getmetatable(async) ~= ASYNC_CHANNEL_OBJECT then
 			return false, "not an async channel"
+		end
+		if type(msk) ~= "number" then
+			return false, "expected a numeric mask"
 		end
 		async:wait(msk)
 		return  -- Return overridden
@@ -330,7 +397,9 @@ function threading.on_context_switch(from, to) end
 
 function threading.context_switch(thr)
 	if thr.wchan ~= nil then
-		if not thr.wchan() then return false end
+		if not ((thr.cancel ~= nil and thr.cancel.ac:poll(thr.cancel.msk)) or thr.wchan()) then
+			return false
+		end
 		thr.wchan = nil
 	end
 
@@ -343,7 +412,6 @@ function threading.context_switch(thr)
 	local success = table.remove(result, 1)
 	thr:translate_to_caps(result)
 	if coroutine.status(thr.co) == "dead" or not success then
-		print('Killing current, coroutine is', coroutine.status(thr.co), 'results were', success, table.unpack(result))
 		thr.result = {success, table.unpack(result)}
 		threading.kill(thr)
 		threading.on_context_switch(threading.current, nil)
@@ -354,7 +422,11 @@ function threading.context_switch(thr)
 	thr.result = result
 	thr.state = "syscall"
 
-	thr.args = {threading.syscall(table.unpack(result))}
+	if not threading.syscall(table.unpack(result)) then
+		threading.on_context_switch(threading.current, nil)
+		threading.current = nil
+		return nil
+	end
 
 	thr.state = "runnable"
 	if thr.wchan ~= nil then
