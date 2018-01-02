@@ -44,6 +44,10 @@ function libthread.thr_current()
 	return coroutine.yield("thr_current")
 end
 
+function libthread.thr_grant(thr, cap)
+	return coroutine.yield("thr_grant", thr, cap)
+end
+
 function libthread.new_sc()
 	return coroutine.yield("new_sc")
 end
@@ -157,6 +161,10 @@ function Thread:kill()
 	return libthread.thr_kill(self.thr)
 end
 
+function Thread:grant(cap)
+	return libthread.thr_grant(self.thr, libthread.convert_value(cap))
+end
+
 Thread.mt = {
 	__index = Thread,
 	sys_convert = function(self) return self.thr end,
@@ -250,12 +258,16 @@ function libthread.run_server(sv, handlers, ac, msk)
 	if type(handlers) == "function" then
 		hdl = handlers
 	elseif type(handlers) == "table" then
-		hdl = function(req, ...)
+		hdl = function(ret, req, ...)
 			local f = handlers[req]
-			if f == nil or type(f) ~= "function" then
-				return
+			if f == nil then return end
+			if type(f) == "function" then
+				return true, f(...)
 			end
-			return f(...)
+			if (type(f) == "table") and type(f.async) == "function" then
+				return f.async(ret, ...)
+			end
+			return true
 		end
 	else
 		error("Inappropriate handler type: " .. type(handlers))
@@ -267,7 +279,11 @@ function libthread.run_server(sv, handlers, ac, msk)
 			local ret = table.remove(values, 1)
 			if type(ret) == "table" then
 				ret = SyncChannel.from(ret)
-				ret:write(hdl(table.unpack(values)))
+				local result = {hdl(ret, table.unpack(values))}
+				local should_reply = table.remove(result, 1)
+				if should_reply then
+					ret:write(table.unpack(result))
+				end
 			end
 		end
 	end

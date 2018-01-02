@@ -20,4 +20,8 @@ function singlet.new()
 	return setmetatable(res, singlet.mt)
 end
 
+function singlet.is_singlet(t)
+	return getmetatable(t) == singlet.SINGLET_OBJECT
+end
+
 return singlet

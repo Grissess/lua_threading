@@ -45,7 +45,10 @@ function Thread.new(obj, ...)
 end
 
 function Thread:grant(obj)
-	local sin = singlet.new()
+	local sin = self.rev_caps[obj]
+	if sin ~= nil then return sin end
+
+	sin = singlet.new()
 	self.caps[sin] = obj
 	self.rev_caps[obj] = sin
 	return sin
@@ -57,7 +60,13 @@ function Thread:translate_to_caps(seq, strict)
 	for i, obj in ipairs(seq) do
 		if self.caps[obj] ~= nil then
 			seq[i] = self.caps[obj]
-		elseif strict and type(obj) == "table" then
+		elseif strict and type(obj) == "table" and not singlet.is_singlet(obj) then
+			if threading.debug then
+				print('For the upcoming error, the table is', obj,'the metatable is', getmetatable(obj), 'and the pairs are:')
+				for k,v in pairs(obj) do
+					print(k, v)
+				end
+			end
 			error("Attempt to pass unrecognized table across supervisor boundary")
 		end
 	end
@@ -67,7 +76,7 @@ function Thread:translate_from_caps(seq, strict)
 	if strict == nil then strict = false end
 
 	for i, obj in ipairs(seq) do
-		if type(obj) == "table" then
+		if type(obj) == "table" and not singlet.is_singlet(obj) then
 			if self.rev_caps[obj] == nil then
 				if strict then
 					error("Attempt to pass ungranted table back to userspace")
@@ -317,6 +326,13 @@ threading.syscall_table = {
 	end,
 	thr_current = function()
 		return threading.current
+	end,
+	thr_grant = function(thr, cap)
+		if getmetatable(thr) ~= THREAD_OBJECT then
+			return false, "not a thread"
+		end
+		local sin = thr:grant(cap)
+		return true, sin
 	end,
 	new_sc = function() return threading.SyncChannel.new() end,
 	sc_write = function(sync, ...)
