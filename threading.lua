@@ -11,7 +11,7 @@ threading.RUNNABLE = {}
 
 function threading.WAIT_INDEFINITELY() return false end
 
-local Thread = {}
+local Thread = {syspq = 16}
 threading.Thread = Thread
 
 local _weak_mt = {__mode = "kv"}
@@ -39,6 +39,8 @@ function Thread.new(obj, ...)
 		},
 		-- wchan = nil or a closure to be called during each scheduling attempt that returns false to block or true to continue
 		-- cancel = nil or {ac = AsyncChannel, msk = number} that, if ac:wait(msk) would not block, cancels the current wait channel
+		-- syspq = 16 (from metatable) determines the maximum number of (nonblocking) syscalls a thread may issue within one quantum
+		-- yield = nil or true to force the thread to give up the remaining quantum
 	}, Thread.mt)
 end
 
@@ -152,6 +154,14 @@ function SyncChannel:read()
 	cur.wchan = threading.WAIT_INDEFINITELY
 end
 
+function SyncChannel:poll_read()
+	return next(self.writers) ~= nil
+end
+
+function SyncChannel:poll_write()
+	return next(self.readers) ~= nil
+end
+
 local SYNC_CHANNEL_OBJECT = {}
 threading.SYNC_CHANNEL_OBJECT = SYNC_CHANNEL_OBJECT
 
@@ -230,7 +240,10 @@ function threading.kill(thr)
 end
 
 threading.syscall_table = {
-	yield = function() return true end,
+	yield = function()
+		threading.current.yield = true
+		return true
+	end,
 	new_thr = function(f, ...)
 		return threading.Thread.new(f, ...)
 	end,
@@ -324,8 +337,19 @@ threading.syscall_table = {
 		if getmetatable(sync) ~= SYNC_CHANNEL_OBJECT then
 			return false, "not a sync channel"
 		end
-		local ret = sync:badged(...)
-		return ret
+		return sync:badged(...)
+	end,
+	sc_poll_read = function(sync)
+		if getmetatable(sync) ~= SYNC_CHANNEL_OBJECT then
+			return false, "not a sync channel"
+		end
+		return sync:poll_read()
+	end,
+	sc_poll_write = function(sync)
+		if getmetatable(sync) ~= SYNC_CHANNEL_OBJECT then
+			return false, "not a sync channel"
+		end
+		return sync:poll_write()
 	end,
 	new_ac = function() return threading.AsyncChannel.new() end,
 	ac_set = function(async, v)
@@ -393,45 +417,66 @@ function threading.syscall(name, ...)
 	return true
 end
 
-function threading.on_context_switch(from, to) end
-
-function threading.context_switch(thr)
+function threading.check_wait(thr)
 	if thr.wchan ~= nil then
 		if not ((thr.cancel ~= nil and thr.cancel.ac:poll(thr.cancel.msk)) or thr.wchan()) then
 			return false
 		end
 		thr.wchan = nil
 	end
+	return true
+end
 
+function threading.on_context_switch(from, to) end
+
+function threading.context_switch(thr)
+	if not threading.check_wait(thr) then
+		return false
+	end
+
+	local execs = 0
 	threading.on_context_switch(threading.current, thr)
 	threading.current = thr
 	thr.state = "running"
 	thr:raise_notify("run")
-	thr:translate_from_caps(thr.args)
-	local result = {coroutine.resume(thr.co, table.unpack(thr.args))}
-	local success = table.remove(result, 1)
-	thr:translate_to_caps(result)
-	if coroutine.status(thr.co) == "dead" or not success then
-		thr.result = {success, table.unpack(result)}
-		threading.kill(thr)
-		threading.on_context_switch(threading.current, nil)
-		threading.current = nil
-		return nil
-	end
 
-	thr.result = result
-	thr.state = "syscall"
+	repeat
+		thr:translate_from_caps(thr.args)
+		local result = {coroutine.resume(thr.co, table.unpack(thr.args))}
+		local success = table.remove(result, 1)
+		thr:translate_to_caps(result)
+		if coroutine.status(thr.co) == "dead" or not success then
+			if threading.debug then
+				print('Thread', thr, 'died, results', success, table.unpack(result))
+			end
+			thr.result = {success, table.unpack(result)}
+			threading.kill(thr)
+			threading.on_context_switch(threading.current, nil)
+			threading.current = nil
+			return nil
+		end
 
-	if not threading.syscall(table.unpack(result)) then
-		threading.on_context_switch(threading.current, nil)
-		threading.current = nil
-		return nil
-	end
+		thr.result = result
+		thr.state = "syscall"
+
+		if not threading.syscall(table.unpack(result)) then
+			threading.on_context_switch(threading.current, nil)
+			threading.current = nil
+			return nil
+		end
+
+		if thr.yield or not threading.check_wait(thr) then
+			break
+		end
+		execs = execs + 1
+	until execs >= thr.syspq
 
 	thr.state = "runnable"
 	if thr.wchan ~= nil then
 		thr.state = "waiting"
 	end
+
+	thr.yield = nil
 	threading.on_context_switch(threading.current, nil)
 	threading.current = nil
 	return true

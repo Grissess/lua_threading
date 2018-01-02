@@ -77,6 +77,10 @@ function threading.on_idle()
 	if times >= 5 then threading.shutdown = true end
 end
 
+threading.on_context_switch = function(from, to)
+	print('CSW', from, to)
+end
+
 thr_main = threading.Thread.new(thread_main)
 thr_main:notify_on("death", main_dead, 1)
 threading.add_runnable(thr_main)

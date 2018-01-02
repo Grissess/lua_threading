@@ -60,6 +60,14 @@ function libthread.sc_badged(sync, ...)
 	return coroutine.yield("sc_badged", sync, ...)
 end
 
+function libthread.sc_poll_read(sync)
+	return coroutine.yield("sc_poll_read", sync)
+end
+
+function libthread.sc_poll_write(sync)
+	return coroutine.yield("sc_poll_write", sync)
+end
+
 function libthread.new_ac()
 	return coroutine.yield("new_ac")
 end
@@ -181,6 +189,14 @@ function SyncChannel:badged(...)
 	return SyncChannel.from(libthread.sc_badged(self.sc, table.unpack(args)))
 end
 
+function SyncChannel:poll_read()
+	return libthread.sc_poll_read(self.sc)
+end
+
+function SyncChannel:poll_write()
+	return libthread.sc_poll_write(self.sc)
+end
+
 function SyncChannel:call(...)
 	local ret = SyncChannel.new()
 	self:write(ret, ...)
@@ -228,5 +244,33 @@ AsyncChannel.mt = {
 	__index = AsyncChannel,
 	sys_convert = function(self) return self.ac end,
 }
+
+function libthread.run_server(sv, handlers, ac, msk)
+	local hdl
+	if type(handlers) == "function" then
+		hdl = handlers
+	elseif type(handlers) == "table" then
+		hdl = function(req, ...)
+			local f = handlers[req]
+			if f == nil or type(f) ~= "function" then
+				return
+			end
+			return f(...)
+		end
+	else
+		error("Inappropriate handler type: " .. type(handlers))
+	end
+
+	while (ac == nil) or (not ac:poll(msk)) do
+		local values = {sv:read()}
+		if #values > 0 then
+			local ret = table.remove(values, 1)
+			if type(ret) == "table" then
+				ret = SyncChannel.from(ret)
+				ret:write(hdl(table.unpack(values)))
+			end
+		end
+	end
+end
 
 return libthread
